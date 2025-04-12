@@ -90,5 +90,6 @@ jobs:
                 - .env
           EOF
 
-      - name: Run scraper using docker-compose
-        run: docker-compose up --abort-on-container-exit --exit-code-from scraper
+      - name: Run scraper using docker compose
+        run: docker compose up --abort-on-container-exit --exit-code-from scraper
+
