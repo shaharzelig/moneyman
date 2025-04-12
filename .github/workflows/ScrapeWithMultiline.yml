@@ -78,6 +78,7 @@ jobs:
           echo "DOMAIN_TRACKING_ENABLED=${{ vars.DOMAIN_TRACKING_ENABLED }}" >> .env
           echo "FIREWALL_SETTINGS=${{ secrets.FIREWALL_SETTINGS }}" >> .env
           echo "BLOCK_BY_DEFAULT=${{ vars.BLOCK_BY_DEFAULT }}" >> .env
+          cat .env
 
       - name: Create docker-compose file
         run: |
