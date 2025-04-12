@@ -1,0 +1,94 @@
+name: ScrapeWithMultiline
+
+on:
+  workflow_dispatch:
+    inputs:
+      accountsToScrape:
+        default: ""
+        required: false
+        description: "Accounts to scrape (comma separated)"
+      daysBack:
+        default: "10"
+        required: false
+        description: "Days back to scrape"
+      worksheetName:
+        default: "auto_moneyman"
+        required: false
+        description: "The name of the worksheet to write to"
+      parallelScrapes:
+        default: "1"
+        required: false
+        description: "Number of parallel scrapes to run"
+      containerTag:
+        default: "latest"
+        required: false
+        description: "Container tag to use (e.g., 'latest', 'pr-123' for PR #123)"
+  schedule:
+    - cron: "5 10,22 * * *"
+
+env:
+  REGISTRY: ghcr.io
+  MAX_PARALLEL_SCRAPERS: 3
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - id: normalize-repository-name
+        run: echo "repository=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - id: set-container-image
+        run: echo "image=${{ env.REGISTRY }}/${{ steps.normalize-repository-name.outputs.repository }}:${{ github.event.inputs.containerTag || 'latest' }}" >> $GITHUB_OUTPUT
+
+      - name: Pull container image
+        run: docker pull ${{ steps.set-container-image.outputs.image }}
+
+      - name: Write .env file for docker-compose
+        run: |
+          echo "DEBUG=" >> .env
+          echo "TZ=Asia/Jerusalem" >> .env
+          echo "DAYS_BACK=${{ github.event.inputs.daysBack }}" >> .env
+          echo "WORKSHEET_NAME=${{ github.event.inputs.worksheetName }}" >> .env
+          echo "ACCOUNTS_TO_SCRAPE=${{ github.event.inputs.accountsToScrape }}" >> .env
+          echo "ACCOUNTS_JSON=${{ secrets.ACCOUNTS_JSON }}" >> .env
+          echo "TELEGRAM_API_KEY=${{ secrets.TELEGRAM_API_KEY }}" >> .env
+          echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          echo "GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}" >> .env
+          echo "GOOGLE_SERVICE_ACCOUNT_EMAIL=${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}" >> .env
+          echo "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY=\"${{ secrets.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY }}\"" >> .env
+          echo "ADE_DATABASE_NAME=${{ secrets.ADE_DATABASE_NAME }}" >> .env
+          echo "ADE_TABLE_NAME=${{ secrets.ADE_TABLE_NAME }}" >> .env
+          echo "ADE_INGESTION_MAPPING=${{ secrets.ADE_INGESTION_MAPPING }}" >> .env
+          echo "ADE_INGEST_URI=${{ secrets.ADE_INGEST_URI }}" >> .env
+          echo "AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> .env
+          echo "AZURE_APP_ID=${{ secrets.AZURE_APP_ID }}" >> .env
+          echo "AZURE_APP_KEY=${{ secrets.AZURE_APP_KEY }}" >> .env
+          echo "YNAB_TOKEN=${{ secrets.YNAB_TOKEN }}" >> .env
+          echo "YNAB_BUDGET_ID=${{ secrets.YNAB_BUDGET_ID }}" >> .env
+          echo "YNAB_ACCOUNTS=${{ secrets.YNAB_ACCOUNTS }}" >> .env
+          echo "BUXFER_USER_NAME=${{ secrets.BUXFER_USER_NAME }}" >> .env
+          echo "BUXFER_PASSWORD=${{ secrets.BUXFER_PASSWORD }}" >> .env
+          echo "BUXFER_ACCOUNTS=${{ secrets.BUXFER_ACCOUNTS }}" >> .env
+          echo "TRANSACTION_HASH_TYPE=${{ secrets.TRANSACTION_HASH_TYPE }}" >> .env
+          echo "WEB_POST_URL=${{ secrets.WEB_POST_URL }}" >> .env
+          echo "MAX_PARALLEL_SCRAPERS=${{ github.event.inputs.parallelScrapes || env.MAX_PARALLEL_SCRAPERS }}" >> .env
+          echo "DOMAIN_TRACKING_ENABLED=${{ vars.DOMAIN_TRACKING_ENABLED }}" >> .env
+          echo "FIREWALL_SETTINGS=${{ secrets.FIREWALL_SETTINGS }}" >> .env
+          echo "BLOCK_BY_DEFAULT=${{ vars.BLOCK_BY_DEFAULT }}" >> .env
+
+      - name: Create docker-compose file
+        run: |
+          cat <<EOF > docker-compose.yml
+          version: '3.8'
+          services:
+            scraper:
+              image: ${{ steps.set-container-image.outputs.image }}
+              env_file:
+                - .env
+          EOF
+
+      - name: Run scraper using docker-compose
+        run: docker-compose up --abort-on-container-exit --exit-code-from scraper
