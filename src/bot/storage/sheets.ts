@@ -1,3 +1,4 @@
+import assert from "node:assert";
 import { createLogger } from "../../utils/logger.js";
 import {
   GoogleSpreadsheet,
@@ -6,51 +7,22 @@ import {
 import { GoogleAuth } from "google-auth-library";
 import type { TransactionRow, TransactionStorage } from "../../types.js";
 import { TransactionStatuses } from "israeli-bank-scrapers/lib/transactions.js";
-import { sendDeprecationMessage } from "../notifier.js";
+import { sendDeprecationMessage, sendError } from "../notifier.js";
 import { createSaveStats } from "../saveStats.js";
-import { TableRow, tableRow } from "../transactionTableRow.js";
-import { retry } from "async";
+import { tableRow } from "../transactionTableRow.js";
+import type { MoneymanConfig } from "../../config.js";
 
 const logger = createLogger("GoogleSheetsStorage");
 
-const {
-  WORKSHEET_NAME,
-  GOOGLE_SHEET_ID = "",
-  GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
-  TRANSACTION_HASH_TYPE,
-} = process.env;
-
-const worksheetName = WORKSHEET_NAME || "_moneyman";
-
-/**
- * Retry configuration for Google API operations with exponential backoff
- * Handles transient errors like 503 "Service is currently unavailable"
- */
-const retryOptions = {
-  times: 3,
-  interval: (retryCount: number) => 100 * Math.pow(2, retryCount - 1), // 100ms, 200ms, 400ms
-  errorFilter: (err: any) => {
-    logger(`Retry attempt due to error: ${err?.message || err}`);
-    // Check if it's a retryable 503 error
-    return (
-      err &&
-      (err.status === 503 ||
-        err.message?.includes("503") ||
-        err.message?.includes("currently unavailable") ||
-        err.message?.includes("temporarily unavailable") ||
-        err.message?.includes("Service Unavailable"))
-    );
-  },
-};
-
 export class GoogleSheetsStorage implements TransactionStorage {
+  private worksheetName: string;
+
+  constructor(private config: MoneymanConfig) {
+    this.worksheetName =
+      this.config.storage.googleSheets?.worksheetName || "_moneyman";
+  }
   canSave() {
-    return Boolean(
-      GOOGLE_SHEET_ID &&
-        GOOGLE_SERVICE_ACCOUNT_EMAIL &&
-        GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
-    );
+    return Boolean(this.config.storage.googleSheets);
   }
 
   async saveTransactions(
@@ -59,39 +31,33 @@ export class GoogleSheetsStorage implements TransactionStorage {
   ) {
     const [doc] = await Promise.all([this.getDoc(), onProgress("Getting doc")]);
 
-    await onProgress("Getting sheet");
-    const sheet = doc.sheetsByTitle[worksheetName];
-    if (!sheet) {
-      throw new Error(`Sheet ${worksheetName} not found`);
-    }
+    await onProgress(`Getting sheet ${this.worksheetName}`);
+    const sheet = doc.sheetsByTitle[this.worksheetName];
+    assert(sheet, `Sheet ${this.worksheetName} not found`);
 
     // Load header row to check if raw column exists
-    await retry(retryOptions, async () => sheet.loadHeaderRow());
+    await sheet.loadHeaderRow();
     const hasRawColumn = sheet.headerValues.includes("raw");
 
-    const [existingHashes] = await Promise.all([
-      this.loadHashes(sheet),
-      onProgress("Loading hashes"),
-    ]);
+    const existingHashes = await this.loadHashes(sheet, onProgress);
 
-    const stats = createSaveStats("Google Sheets", worksheetName, txns, {
+    const stats = createSaveStats("Google Sheets", this.worksheetName, txns, {
       highlightedTransactions: {
         Added: [] as Array<TransactionRow>,
       },
     });
 
-    const rows: TableRow[] = [];
-    for (let tx of txns) {
-      if (TRANSACTION_HASH_TYPE === "moneyman") {
+    const newTxns = txns.filter((tx) => {
+      if (this.config.options.scraping.transactionHashType === "moneyman") {
         // Use the new uniqueId as the unique identifier for the transactions if the hash type is moneyman
         if (existingHashes.has(tx.uniqueId)) {
           stats.existing++;
-          continue;
+          return false;
         }
       }
 
       if (existingHashes.has(tx.hash)) {
-        if (TRANSACTION_HASH_TYPE === "moneyman") {
+        if (this.config.options.scraping.transactionHashType === "moneyman") {
           logger(`Skipping, old hash ${tx.hash} is already in the sheet`);
         }
 
@@ -100,25 +66,33 @@ export class GoogleSheetsStorage implements TransactionStorage {
           stats.existing++;
         }
 
-        continue;
+        return false;
       }
 
-      if (tx.status === TransactionStatuses.Pending) {
-        continue;
-      }
+      return tx.status !== TransactionStatuses.Pending;
+    });
 
-      rows.push(tableRow(tx, hasRawColumn));
-      stats.highlightedTransactions.Added.push(tx);
-    }
-
+    const rows = newTxns.map((tx) => tableRow(tx, hasRawColumn));
     if (rows.length) {
-      stats.added = rows.length;
-      await Promise.all([
-        onProgress(`Saving ${rows.length} rows`),
-        retry(retryOptions, async () => sheet.addRows(rows)),
-      ]);
-      if (TRANSACTION_HASH_TYPE !== "moneyman") {
-        sendDeprecationMessage("hashFiledChange");
+      try {
+        stats.highlightedTransactions.Added.push(...newTxns);
+        stats.added = rows.length;
+        await Promise.all([
+          onProgress(`Saving ${rows.length} rows`),
+          sheet.addRows(rows),
+        ]);
+        if (this.config.options.scraping.transactionHashType !== "moneyman") {
+          sendDeprecationMessage("hashFiledChange");
+        }
+      } catch (e) {
+        logger("Error saving transactions", e);
+        sendError(e, "GoogleSheetsStorage::saveTransactions");
+        const hashes = await this.loadHashes(sheet, onProgress);
+        const notSaved = newTxns.filter(
+          ({ hash, uniqueId }) => !hashes.has(hash) && !hashes.has(uniqueId),
+        );
+        stats.added -= notSaved.length;
+        stats.otherSkipped = notSaved.length;
       }
     }
 
@@ -126,48 +100,45 @@ export class GoogleSheetsStorage implements TransactionStorage {
   }
 
   private async getDoc() {
+    const googleSheetsConfig = this.config.storage.googleSheets;
+    assert(googleSheetsConfig, "Google Sheets configuration not found");
+
     const auth = new GoogleAuth({
       scopes: ["https://www.googleapis.com/auth/spreadsheets"],
       credentials: {
-        client_email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
-        private_key: GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
+        client_email: googleSheetsConfig.serviceAccountEmail,
+        private_key: googleSheetsConfig.serviceAccountPrivateKey,
       },
     });
-
-    const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID, auth);
-    await retry(retryOptions, async () => doc.loadInfo());
+    const authClient = await auth.getClient();
+    const doc = new GoogleSpreadsheet(googleSheetsConfig.sheetId, authClient);
+    await doc.loadInfo();
     return doc;
   }
 
   /**
    * Load hashes from the "hash" column, assuming the first row is a header row
    */
-  private async loadHashes(sheet: GoogleSpreadsheetWorksheet) {
-    // Header row should already be loaded by the caller
+  private async loadHashes(
+    sheet: GoogleSpreadsheetWorksheet,
+    onProgress: (status: string) => Promise<void>,
+  ) {
+    const column = sheet.headerValues.indexOf("hash");
+    assert(column !== -1, "Hash column not found");
+    assert(column < 26, "Currently only supports single letter columns");
 
-    const hashColumnNumber = sheet.headerValues.indexOf("hash");
-    if (hashColumnNumber === -1) {
-      throw new Error("Hash column not found");
-    }
-
-    if (hashColumnNumber >= 26) {
-      throw new Error("Currently only supports single letter columns");
-    }
-
-    const columnLetter = String.fromCharCode(65 + hashColumnNumber);
+    const columnLetter = String.fromCharCode(65 + column);
     const range = `${columnLetter}2:${columnLetter}`;
 
-    const columns = await retry(retryOptions, async () =>
+    const [columns] = await Promise.all([
       sheet.getCellsInRange(range, {
         majorDimension: "COLUMNS",
       }),
-    );
+      onProgress(`Loading hashes (${range})`),
+    ]);
 
-    if (Array.isArray(columns)) {
-      return new Set(columns[0] as string[]);
-    }
-
-    // Return empty set for sheets with only headers (no data rows)
-    return new Set<string>();
+    return Array.isArray(columns)
+      ? new Set(columns[0] as string[])
+      : new Set<string>();
   }
 }
