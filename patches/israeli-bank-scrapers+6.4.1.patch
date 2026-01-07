@@ -1,0 +1,103 @@
+diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js b/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
+index 354b61e..a64fdd7 100644
+--- a/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
++++ b/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
+@@ -134,6 +134,39 @@ async function fetchTransactions(page, startDate) {
+   // DEVELOPER NOTICE the account number received from the server is being altered at
+   // runtime for some accounts after 1-2 seconds so we need to hang the process for a short while.
+   await hangProcess(4000);
++  try {
++    debug('checking for post-login WalkMe dialog');
++    await (0, _elementsInteractions.waitUntilElementFound)(page, '.walkme-to-remove', true, 3000);
++    debug('closing post-login dialog by clicking button');
++    const buttonIds = ['#f3ac5286-8b3d-1bff-cca8-105a2e34e114',
++    // Bottom button
++    '#b7d1657b-1334-9615-64e9-16cd2d87de77' // X button top-left
++    ];
++    let clicked = false;
++    for (const buttonId of buttonIds) {
++      try {
++        await (0, _elementsInteractions.waitUntilElementFound)(page, buttonId, true, 1000);
++        await (0, _elementsInteractions.clickButton)(page, buttonId);
++        debug(`Successfully clicked dialog button: ${buttonId}`);
++        clicked = true;
++        break;
++      } catch (e) {
++        debug(`Button ${buttonId} not found or not clickable, trying next`);
++      }
++    }
++    // Force remove dialog if clicking didn't work
++    if (!clicked) {
++      debug('No button worked, forcing dialog removal via JavaScript');
++      await page.evaluate(() => {
++        const dialogs = document.querySelectorAll('.walkme-to-remove');
++        dialogs.forEach(dialog => dialog.remove());
++      });
++    }
++    // Wait longer for page to settle after dialog removal
++    await hangProcess(2000);
++  } catch (e) {
++    debug('no post-login dialog found or already closed');
++  }
+   const accountsIds = await page.evaluate(() => Array.from(document.querySelectorAll('app-masked-number-combo span.display-number-li'), e => e.textContent));
+ 
+   // due to a bug, the altered value might include undesired signs like & that should be removed
+@@ -145,14 +178,25 @@ async function fetchTransactions(page, startDate) {
+     if (accountsIds.length > 1) {
+       // get list of accounts and check accountId
+       await clickByXPath(page, 'xpath///*[contains(@class, "number") and contains(@class, "combo-inner")]');
+-      await clickByXPath(page, `xpath///span[contains(text(), '${accountId}')]`);
++      // Clean the account ID - remove RTL/LTR marks and ALL whitespace
++      const cleanAccountId = accountId?.replace(/[\u200E\u200F\u202A-\u202E\s]/g, '') || '';
++      await clickByXPath(page, `xpath///span[contains(text(), '${cleanAccountId}')]`);
+     }
+-    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId)));
++    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId || '')));
+   }
+   return accounts;
+ }
+ async function navigateToLogin(page) {
+-  const loginButtonSelector = '.enter-account a[originaltitle="כניסה לחשבונך"]';
++  try {
++    debug('checking for cookie consent dialog');
++    await (0, _elementsInteractions.waitUntilElementFound)(page, 'button.hide-alert', true, 5000);
++    debug('closing cookie consent dialog');
++    await (0, _elementsInteractions.clickButton)(page, 'button.hide-alert');
++    await hangProcess(500); // Brief wait after closing dialog
++  } catch (e) {
++    debug('no cookie dialog found or already closed');
++  }
++  const loginButtonSelector = 'a.enter_account';
+   debug('wait for homepage to click on login button');
+   await (0, _elementsInteractions.waitUntilElementFound)(page, loginButtonSelector);
+   debug('navigate to login page');
+diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js b/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js
+index 09768ac..3f9875f 100644
+--- a/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js
++++ b/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js
+@@ -17,7 +17,7 @@ var _baseScraperWithBrowser = require("./base-scraper-with-browser");
+ var _lodash = _interopRequireDefault(require("lodash"));
+ function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
+ const apiHeaders = {
+-  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
++  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+   Origin: 'https://digital-web.cal-online.co.il',
+   Referer: 'https://digital-web.cal-online.co.il',
+   'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+@@ -284,14 +284,14 @@ class VisaCalScraper extends _baseScraperWithBrowser.BaseScraperWithBrowser {
+           'Content-Type': 'application/json',
+           ...apiHeaders
+         });
+-        if (monthData?.statusCode !== 1) throw new Error(`failed to fetch transactions for card ${card.last4Digits}. Message: ${monthData?.title || ''}`);
++        if (monthData?.statusCode !== 1) throw new Error(`failed to fetch transactions for card ${card.last4Digits}. Message: ${JSON.stringify(monthData)}`);
+         if (!isCardTransactionDetails(monthData)) {
+           throw new Error('monthData is not of type CardTransactionDetails');
+         }
+         allMonthsData.push(monthData);
+       }
+       if (pendingData?.statusCode !== 1 && pendingData?.statusCode !== 96) {
+-        debug(`failed to fetch pending transactions for card ${card.last4Digits}. Message: ${pendingData?.title || ''}`);
++        debug(`failed to fetch pending transactions for card ${card.last4Digits}. Message: ${JSON.stringify(pendingData)}`);
+         pendingData = null;
+       } else if (!isCardPendingTransactionDetails(pendingData)) {
+         debug('pendingData is not of type CardTransactionDetails');
