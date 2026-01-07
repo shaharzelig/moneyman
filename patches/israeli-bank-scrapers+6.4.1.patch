@@ -1,3 +1,434 @@
+diff --git a/node_modules/israeli-bank-scrapers/lib/definitions.d.ts b/node_modules/israeli-bank-scrapers/lib/definitions.d.ts
+index 4752885..c743a12 100644
+--- a/node_modules/israeli-bank-scrapers/lib/definitions.d.ts
++++ b/node_modules/israeli-bank-scrapers/lib/definitions.d.ts
+@@ -17,7 +17,8 @@ export declare enum CompanyTypes {
+     behatsdaa = "behatsdaa",
+     beyahadBishvilha = "beyahadBishvilha",
+     oneZero = "oneZero",
+-    pagi = "pagi"
++    pagi = "pagi",
++    cibus = "cibus"
+ }
+ export declare const SCRAPERS: {
+     hapoalim: {
+@@ -92,6 +93,10 @@ export declare const SCRAPERS: {
+         name: string;
+         loginFields: string[];
+     };
++    cibus: {
++        name: string;
++        loginFields: string[];
++    };
+ };
+ export declare enum ScraperProgressTypes {
+     Initializing = "INITIALIZING",
+diff --git a/node_modules/israeli-bank-scrapers/lib/definitions.js b/node_modules/israeli-bank-scrapers/lib/definitions.js
+index e9fe28e..2f61c1a 100644
+--- a/node_modules/israeli-bank-scrapers/lib/definitions.js
++++ b/node_modules/israeli-bank-scrapers/lib/definitions.js
+@@ -26,6 +26,7 @@ let CompanyTypes = exports.CompanyTypes = /*#__PURE__*/function (CompanyTypes) {
+   CompanyTypes["beyahadBishvilha"] = "beyahadBishvilha";
+   CompanyTypes["oneZero"] = "oneZero";
+   CompanyTypes["pagi"] = "pagi";
++  CompanyTypes["cibus"] = "cibus";
+   return CompanyTypes;
+ }({});
+ const SCRAPERS = exports.SCRAPERS = {
+@@ -100,6 +101,10 @@ const SCRAPERS = exports.SCRAPERS = {
+   [CompanyTypes.pagi]: {
+     name: 'Pagi',
+     loginFields: ['username', PASSWORD_FIELD]
++  },
++  [CompanyTypes.cibus]: {
++    name: 'Cibus',
++    loginFields: ['username', PASSWORD_FIELD, 'company']
+   }
+ };
+ let ScraperProgressTypes = exports.ScraperProgressTypes = /*#__PURE__*/function (ScraperProgressTypes) {
+diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/cibus.d.ts b/node_modules/israeli-bank-scrapers/lib/scrapers/cibus.d.ts
+new file mode 100644
+index 0000000..50de408
+--- /dev/null
++++ b/node_modules/israeli-bank-scrapers/lib/scrapers/cibus.d.ts
+@@ -0,0 +1,16 @@
++import { BaseScraperWithBrowser } from './base-scraper-with-browser';
++import { type ScraperScrapingResult } from './interface';
++type ScraperSpecificCredentials = {
++    username: string;
++    password: string;
++    company: string;
++    cookie?: string;
++};
++declare class CibusScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
++    login(credentials: ScraperSpecificCredentials): Promise<any>;
++    private isLoginSucceeded;
++    isOtpRequired(): Promise<boolean>;
++    fetchData(): Promise<ScraperScrapingResult>;
++    private parseTransactions;
++}
++export default CibusScraper;
+diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/cibus.js b/node_modules/israeli-bank-scrapers/lib/scrapers/cibus.js
+new file mode 100644
+index 0000000..b3c8fc8
+--- /dev/null
++++ b/node_modules/israeli-bank-scrapers/lib/scrapers/cibus.js
+@@ -0,0 +1,334 @@
++"use strict";
++
++Object.defineProperty(exports, "__esModule", {
++  value: true
++});
++exports.default = void 0;
++var _moment = _interopRequireDefault(require("moment"));
++var _transactions = require("../transactions");
++var _baseScraperWithBrowser = require("./base-scraper-with-browser");
++var _errors = require("./errors");
++var _waiting = require("../helpers/waiting");
++var _navigation = require("../helpers/navigation");
++function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
++
++// const debug = getDebug('cibus');
++const debug = console.log;
++const LOGIN_URL = 'https://consumers.pluxee.co.il/login';
++
++function parseSetCookieHeader(cookieHeader) {
++  const parts = cookieHeader.split(';').map(part => part.trim());
++  const [nameValue] = parts;
++  const [name, value] = nameValue.split('=');
++
++  const cookie = { name, value };
++
++  for (let i = 1; i < parts.length; i++) {
++    const [key, val] = parts[i].split('=');
++    const lowerKey = key.toLowerCase();
++
++    switch (lowerKey) {
++      case 'domain':
++        cookie.domain = val.startsWith('.') ? val : `.${val}`;
++        break;
++      case 'path':
++        cookie.path = val;
++        break;
++      case 'expires':
++        cookie.expires = new Date(val).getTime() / 1000; // Convert to Unix timestamp
++        break;
++      case 'httponly':
++        cookie.httpOnly = true;
++        break;
++      case 'secure':
++        cookie.secure = true;
++        break;
++      case 'samesite':
++        cookie.sameSite = val;
++        break;
++    }
++  }
++
++  return cookie;
++}
++
++class CibusScraper extends _baseScraperWithBrowser.BaseScraperWithBrowser {
++  async login(credentials) {
++    await this.navigateTo(LOGIN_URL);
++
++    // If cookie is provided, set cookies from credentials
++    if (credentials.cookie) {
++      console.log('Setting cookies from credentials');
++      const cookiesStrings = credentials.cookie.split('%%--%%');
++
++      for (const cookie of cookiesStrings) {
++        await this.page.setCookie(parseSetCookieHeader(cookie));
++      }
++    }
++
++    try {
++      // 1) Type username
++      await this.page.waitForSelector('#user', { visible: true });
++      await this.page.type('#user', credentials.username);
++
++      // 2) Blur username so the form state updates
++      await this.page.keyboard.press('Tab'); // or:
++      // await this.page.$eval('#user', el => (el as HTMLInputElement).blur());
++
++      // 3) Wait a bit or for visible button
++      await this.page.waitForSelector('.login-btn-container .cib-btn.cib-pink-grad', {
++        visible: true,
++      });
++
++      // 4) Click via page.evaluate (bypasses clickablePoint)
++      await this.page.evaluate(() => {
++        const btn = document.querySelector('.login-btn-container .cib-btn.cib-pink-grad');
++        if (!btn) throw new Error('Continue button not found');
++        btn.click();
++      });
++
++      await this.page.waitForSelector('#password');
++      await this.page.type('#password', credentials.password);
++
++      await this.page.waitForSelector('#company-inp');
++      await this.page.type('#company-inp', credentials.company);
++
++      // 4) Click via page.evaluate (bypasses clickablePoint)
++      await this.page.evaluate(() => {
++        const btn = document.querySelector('.login-btn-container .cib-btn.cib-pink-grad');
++        if (!btn) throw new Error('Continue button not found');
++        btn.click();
++      });
++
++      await (0, _navigation.waitForNavigation)(this.page);
++
++      if (this.isLoginSucceeded()) {
++        debug('Login succeeded');
++        return { success: true };
++      }
++      debug('Login not succeeded, checking for OTP...');
++      debug('Current URL:', this.page.url());
++      if (await this.isOtpRequired()) {
++        debug('OTP required - not supported');
++        return {
++          success: false,
++          errorType: _errors.ScraperErrorTypes.TwoFactorRetrieverMissing,
++          errorMessage: 'OTP required - not supported',
++        };
++      }
++      debug('OTP not detected, assuming invalid password');
++      return {
++        success: false,
++        errorType: _errors.ScraperErrorTypes.InvalidPassword,
++        errorMessage: 'Login failed',
++      };
++    } catch (e) {
++      return {
++        success: false,
++        errorType: _errors.ScraperErrorTypes.General,
++        errorMessage: `Login error: ${e.message}`,
++      };
++    }
++  }
++
++  isLoginSucceeded() {
++    const currentUrl = this.page.url();
++    debug('Checking login success by verifying URL changed from login page');
++    debug('Current URL:', currentUrl);
++    if (currentUrl !== LOGIN_URL) {
++      debug('Login succeeded - navigated away from login page');
++      return true;
++    }
++    debug('Login did not succeed - still on login page');
++    return false;
++  }
++
++  async isOtpRequired() {
++    try {
++      debug('Waiting for OTP container...');
++      await this.page.waitForSelector('.otp-container', { timeout: 5000 });
++      debug('OTP container found');
++      return true;
++    } catch {
++      debug('OTP container not found within 5 seconds');
++      // Let's also check what elements are present that might indicate OTP
++      try {
++        const otpElements = await this.page.$$('[class*="otp"], [id*="otp"], input[type="tel"], .verification');
++        debug(`Found ${otpElements.length} potential OTP-related elements`);
++        if (otpElements.length > 0) {
++          for (let i = 0; i < Math.min(otpElements.length, 3); i++) {
++            const el = otpElements[i];
++            const tagName = await el.evaluate(e => e.tagName);
++            const className = await el.evaluate(e => e.className);
++            const id = await el.evaluate(e => e.id);
++            debug(`OTP element ${i}: ${tagName} class="${className}" id="${id}"`);
++          }
++        }
++      } catch (e) {
++        debug('Error checking for OTP elements:', e.message);
++      }
++      return false;
++    }
++  }
++
++  async fetchData() {
++    debug('Fetching Cibus transaction data');
++    console.log('Fetching Cibus transaction data');
++
++    try {
++      await (0, _waiting.sleep)(5000);
++
++      await this.navigateTo('https://consumers.pluxee.co.il/user/orders');
++
++      // Get cookies to extract the token
++      const cookies = await this.page.cookies();
++      debug(
++        'All cookies:',
++        cookies.map(c => ({ name: c.name, value: c.value.substring(0, 20) + '...' })),
++      );
++
++      const tokenCookie = cookies.find(cookie => cookie.name === 'token');
++      if (!tokenCookie) {
++        debug('Token cookie not found among cookies');
++        throw new Error('Token cookie not found');
++      }
++
++      const token = tokenCookie.value;
++      debug(`Found token: ${token.substring(0, 20)}...`);
++
++      // Make API call to fetch transactions
++      const apiUrl = 'https://api.consumers.pluxee.co.il/api/main.py';
++      const startDate = (0, _moment.default)(this.options.startDate).format('DD/MM/YYYY');
++      const calculatedEndDate = (0, _moment.default)(this.options.startDate).add(this.options.futureMonthsToScrape || 2, 'months');
++      const today = (0, _moment.default)();
++      const endDate = calculatedEndDate.isAfter(today)
++        ? today.format('DD/MM/YYYY')
++        : calculatedEndDate.format('DD/MM/YYYY');
++      const requestBody = {
++        from_date: startDate,
++        to_date: endDate,
++        type: 'prx_user_deals',
++      };
++
++      debug(`Making API request to ${apiUrl} with body:`, requestBody);
++
++      const headers = {
++        'application-id': 'E5D5FEF5-A05E-4C64-AEBA-BA0CECA0E402',
++        Cookie: `token=${token}`,
++        'Content-Type': 'application/json',
++      };
++      debug('Headers being sent:', headers);
++
++      const apiResponse = await fetch(apiUrl, {
++        method: 'POST',
++        headers,
++        body: JSON.stringify(requestBody),
++      });
++
++      if (!apiResponse.ok) {
++        throw new Error(`API request failed with status ${apiResponse.status}: ${apiResponse.statusText}`);
++      }
++
++      const responseJson = await apiResponse.json();
++
++      // Parse the response and convert to transactions
++      const allTransactions = this.parseTransactions(responseJson);
++
++      const accounts = [
++        {
++          accountNumber: 'cibus-account',
++          txns: allTransactions,
++        },
++      ];
++
++      return {
++        success: true,
++        accounts,
++      };
++    } catch (error) {
++      debug('Error fetching Cibus data:', error);
++      return {
++        success: false,
++        errorType: _errors.ScraperErrorTypes.General,
++        errorMessage: `Failed to fetch transaction data: ${error.message}`,
++      };
++    }
++  }
++
++  parseTransactions(apiResponse) {
++    const transactions = [];
++
++    // debug('Parsing API response:', apiResponse);
++
++    if (apiResponse && apiResponse.list && Array.isArray(apiResponse.list)) {
++      for (const item of apiResponse.list) {
++        // Skip undefined or null items
++        if (!item || typeof item !== 'object') {
++          debug('Skipping invalid item:', item);
++          continue;
++        }
++        // Skip items with missing required fields
++        if (!item.date || !item.time || !item.rest_name || !item.deal_id) {
++          debug('Skipping item with missing fields:', item);
++          continue;
++        }
++
++        // Parse date from DD/MM/YYYY format
++        const dateParts = item.date.split('/');
++        if (dateParts.length !== 3) {
++          debug('Invalid date format:', item.date);
++          continue;
++        }
++        const isoDate = `${dateParts[2]}-${dateParts[1].padStart(2, '0')}-${dateParts[0].padStart(2, '0')}`;
++
++        // Combine date and time for processedDate
++        const processedDate = (0, _moment.default)(`${item.date} ${item.time}`, 'DD/MM/YYYY HH:mm').toISOString();
++
++        let description = item.rest_name;
++        if (item.voucher_code) {
++          description += ` (Voucher: ${item.voucher_code})`;
++        }
++
++        // Handle company price as income (positive)
++        if (item.etc_company_price && item.etc_company_price > 0) {
++          const companyTransaction = {
++            type: _transactions.TransactionTypes.Normal,
++            identifier: `${item.deal_id}_company`,
++            date: isoDate,
++            processedDate,
++            originalAmount: item.etc_company_price,
++            originalCurrency: 'ILS',
++            chargedAmount: item.etc_company_price,
++            chargedCurrency: 'ILS',
++            description: `${description} - Company contribution`,
++            status: _transactions.TransactionStatuses.Completed,
++            category: 'משכורת',
++          };
++          transactions.push(companyTransaction);
++        }
++
++        // Handle employee price as expense (negative)
++        if (item.etc_employee_price && item.etc_employee_price > 0) {
++          const employeeTransaction = {
++            type: _transactions.TransactionTypes.Normal,
++            identifier: `${item.deal_id}_employee`,
++            date: isoDate,
++            processedDate,
++            originalAmount: -Math.abs(item.etc_employee_price),
++            originalCurrency: 'ILS',
++            chargedAmount: -Math.abs(item.etc_employee_price),
++            chargedCurrency: 'ILS',
++            description: `${description} - Employee payment`,
++            status: _transactions.TransactionStatuses.Completed,
++            category: description.includes('voucher') ? 'קניות מזון' : 'אוכל בחוץ',
++          };
++          transactions.push(employeeTransaction);
++        }
++      }
++    }
++
++    return transactions;
++  }
++}
++
++var _default = exports.default = CibusScraper;
+diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/factory.js b/node_modules/israeli-bank-scrapers/lib/scrapers/factory.js
+index 901089c..b6006ba 100644
+--- a/node_modules/israeli-bank-scrapers/lib/scrapers/factory.js
++++ b/node_modules/israeli-bank-scrapers/lib/scrapers/factory.js
+@@ -24,6 +24,7 @@ var _pagi = _interopRequireDefault(require("./pagi"));
+ var _unionBank = _interopRequireDefault(require("./union-bank"));
+ var _visaCal = _interopRequireDefault(require("./visa-cal"));
+ var _yahav = _interopRequireDefault(require("./yahav"));
++var _cibus = _interopRequireDefault(require("./cibus"));
+ function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
+ function createScraper(options) {
+   switch (options.companyId) {
+@@ -63,6 +64,8 @@ function createScraper(options) {
+       return new _behatsdaa.default(options);
+     case _definitions.CompanyTypes.pagi:
+       return new _pagi.default(options);
++    case _definitions.CompanyTypes.cibus:
++      return new _cibus.default(options);
+     default:
+       return (0, _assertNever.assertNever)(options.companyId, `unknown company id ${options.companyId}`);
+   }
 diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js b/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
 index 354b61e..a64fdd7 100644
 --- a/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
