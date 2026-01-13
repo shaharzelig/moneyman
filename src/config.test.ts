@@ -24,6 +24,7 @@ describe("config", () => {
     expect(parsed.accounts).toEqual([]);
     expect(parsed.storage.localJson?.enabled).toBe(true);
     expect(parsed.options.scraping.daysBack).toBe(10);
+    expect(parsed.options.scraping.includeRawTransaction).toBe(false);
     expect(parsed.options.logging.getIpInfoUrl).toBe("https://ipinfo.io/json");
   });
 
@@ -217,6 +218,56 @@ describe("config", () => {
     const { unlinkSync, rmdirSync } = await import("fs");
     unlinkSync(configPath);
     rmdirSync(tempDir);
+  });
+
+  it("should support includeRawTransaction option", async () => {
+    const configWithRawTransaction = {
+      accounts: [{ companyId: "test", password: "pass", userCode: "12345" }],
+      storage: { localJson: { enabled: true } },
+      options: {
+        scraping: {
+          includeRawTransaction: true,
+        },
+        security: {},
+        notifications: {},
+        logging: {},
+      },
+    };
+
+    process.env = {
+      ...originalEnv,
+      MONEYMAN_CONFIG_PATH: undefined,
+      MONEYMAN_CONFIG: JSON.stringify(configWithRawTransaction),
+    };
+
+    const { config } = await import("./config.js");
+
+    expect(config.options.scraping.includeRawTransaction).toBe(true);
+  });
+
+  it("should default includeRawTransaction to false when not specified", async () => {
+    const configWithoutRawTransaction = {
+      accounts: [{ companyId: "test", password: "pass", userCode: "12345" }],
+      storage: { localJson: { enabled: true } },
+      options: {
+        scraping: {
+          daysBack: 15,
+        },
+        security: {},
+        notifications: {},
+        logging: {},
+      },
+    };
+
+    process.env = {
+      ...originalEnv,
+      MONEYMAN_CONFIG_PATH: undefined,
+      MONEYMAN_CONFIG: JSON.stringify(configWithoutRawTransaction),
+    };
+
+    const { config } = await import("./config.js");
+
+    expect(config.options.scraping.includeRawTransaction).toBe(false);
   });
 
   it("should prioritize MONEYMAN_CONFIG over MONEYMAN_CONFIG_PATH", async () => {
@@ -559,6 +610,98 @@ describe("config", () => {
       // Should return default config with empty accounts
       expect(config.accounts).toEqual([]);
       expect(config.storage.localJson?.enabled).toBe(true);
+    });
+  });
+
+  describe("getIpInfoUrl configuration", () => {
+    it("should allow getIpInfoUrl to be false", () => {
+      const configWithDisabledIp = {
+        accounts: [{ companyId: "test", password: "pass" }],
+        storage: { localJson: { enabled: true } },
+        options: {
+          scraping: {},
+          security: {},
+          notifications: {},
+          logging: {
+            getIpInfoUrl: false,
+          },
+        },
+      };
+
+      const parsed = MoneymanConfigSchema.parse(configWithDisabledIp);
+      expect(parsed.options.logging.getIpInfoUrl).toBe(false);
+    });
+
+    it("should allow getIpInfoUrl to be a valid URL string", () => {
+      const configWithCustomUrl = {
+        accounts: [{ companyId: "test", password: "pass" }],
+        storage: { localJson: { enabled: true } },
+        options: {
+          scraping: {},
+          security: {},
+          notifications: {},
+          logging: {
+            getIpInfoUrl: "https://api.myservice.com/ip",
+          },
+        },
+      };
+
+      const parsed = MoneymanConfigSchema.parse(configWithCustomUrl);
+      expect(parsed.options.logging.getIpInfoUrl).toBe(
+        "https://api.myservice.com/ip",
+      );
+    });
+
+    it("should use default URL when getIpInfoUrl is not provided", () => {
+      const configWithoutIpUrl = {
+        accounts: [{ companyId: "test", password: "pass" }],
+        storage: { localJson: { enabled: true } },
+        options: {
+          scraping: {},
+          security: {},
+          notifications: {},
+          logging: {},
+        },
+      };
+
+      const parsed = MoneymanConfigSchema.parse(configWithoutIpUrl);
+      expect(parsed.options.logging.getIpInfoUrl).toBe(
+        "https://ipinfo.io/json",
+      );
+    });
+
+    it("should reject invalid URL for getIpInfoUrl", () => {
+      const configWithInvalidUrl = {
+        accounts: [{ companyId: "test", password: "pass" }],
+        storage: { localJson: { enabled: true } },
+        options: {
+          scraping: {},
+          security: {},
+          notifications: {},
+          logging: {
+            getIpInfoUrl: "not-a-valid-url",
+          },
+        },
+      };
+
+      expect(() => MoneymanConfigSchema.parse(configWithInvalidUrl)).toThrow();
+    });
+
+    it("should reject true for getIpInfoUrl (only false or URL allowed)", () => {
+      const configWithTrue = {
+        accounts: [{ companyId: "test", password: "pass" }],
+        storage: { localJson: { enabled: true } },
+        options: {
+          scraping: {},
+          security: {},
+          notifications: {},
+          logging: {
+            getIpInfoUrl: true,
+          },
+        },
+      };
+
+      expect(() => MoneymanConfigSchema.parse(configWithTrue)).toThrow();
     });
   });
 });

@@ -32,10 +32,14 @@
       // Number of future months to scrape (default: 1)
       // "futureMonths": 1,
       // Maximum number of parallel scrapers (default: 1)
-      // "maxParallelScrapers": 1
+      // "maxParallelScrapers": 1,
+      // Include raw transaction data for debugging purposes (default: false)
+      // "includeRawTransaction": false
     },
     "logging": {
+      // URL to fetch external IP information, or false to disable
       // "getIpInfoUrl": "https://ipinfo.io/json"
+      // "getIpInfoUrl": false
     },
     "security": {
       // Block domains by default (default: false)
