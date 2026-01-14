@@ -430,10 +430,10 @@ index 901089c..b6006ba 100644
        return (0, _assertNever.assertNever)(options.companyId, `unknown company id ${options.companyId}`);
    }
 diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js b/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
-index 354b61e..a64fdd7 100644
+index 0d6a377..401e6af 100644
 --- a/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
 +++ b/node_modules/israeli-bank-scrapers/lib/scrapers/leumi.js
-@@ -134,6 +134,39 @@ async function fetchTransactions(page, startDate) {
+@@ -137,6 +137,39 @@ async function fetchTransactions(page, startDate, options) {
    // DEVELOPER NOTICE the account number received from the server is being altered at
    // runtime for some accounts after 1-2 seconds so we need to hang the process for a short while.
    await hangProcess(4000);
@@ -473,7 +473,7 @@ index 354b61e..a64fdd7 100644
    const accountsIds = await page.evaluate(() => Array.from(document.querySelectorAll('app-masked-number-combo span.display-number-li'), e => e.textContent));
  
    // due to a bug, the altered value might include undesired signs like & that should be removed
-@@ -145,14 +178,25 @@ async function fetchTransactions(page, startDate) {
+@@ -148,14 +181,25 @@ async function fetchTransactions(page, startDate, options) {
      if (accountsIds.length > 1) {
        // get list of accounts and check accountId
        await clickByXPath(page, 'xpath///*[contains(@class, "number") and contains(@class, "combo-inner")]');
@@ -482,8 +482,8 @@ index 354b61e..a64fdd7 100644
 +      const cleanAccountId = accountId?.replace(/[\u200E\u200F\u202A-\u202E\s]/g, '') || '';
 +      await clickByXPath(page, `xpath///span[contains(text(), '${cleanAccountId}')]`);
      }
--    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId)));
-+    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId || '')));
+-    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId), options));
++    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId || ''), options));
    }
    return accounts;
  }
@@ -503,7 +503,7 @@ index 354b61e..a64fdd7 100644
    await (0, _elementsInteractions.waitUntilElementFound)(page, loginButtonSelector);
    debug('navigate to login page');
 diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js b/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js
-index 09768ac..3f9875f 100644
+index e1db751..ad143c5 100644
 --- a/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js
 +++ b/node_modules/israeli-bank-scrapers/lib/scrapers/visa-cal.js
 @@ -17,7 +17,7 @@ var _baseScraperWithBrowser = require("./base-scraper-with-browser");
@@ -515,7 +515,7 @@ index 09768ac..3f9875f 100644
    Origin: 'https://digital-web.cal-online.co.il',
    Referer: 'https://digital-web.cal-online.co.il',
    'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
-@@ -284,14 +284,14 @@ class VisaCalScraper extends _baseScraperWithBrowser.BaseScraperWithBrowser {
+@@ -287,14 +287,14 @@ class VisaCalScraper extends _baseScraperWithBrowser.BaseScraperWithBrowser {
            'Content-Type': 'application/json',
            ...apiHeaders
          });
