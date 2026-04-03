@@ -69,7 +69,7 @@ async function runMoneyman() {
         async (status, totalTime) => hooks.onStatusChanged(status, totalTime),
         (e, caller) => {
           console.error('[6] scraper onError:', caller, e?.message);
-          if (caller === 'cibus' || e?.message?.includes('cibus') || e?.errorType === 'InvalidPassword') {
+          if (caller === 'cibus') {
             cibusAuthFailed = true;
           }
           hooks.onError(e, caller);
