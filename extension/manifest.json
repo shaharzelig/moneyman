@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Moneyman Auth Bridge",
+  "version": "1.0.0",
+  "description": "Handles Cibus/Pluxee authentication for Moneyman via Stocky",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "cookies",
+    "tabs",
+    "alarms",
+    "identity",
+    "notifications",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://consumers.pluxee.co.il/*",
+    "https://identitytoolkit.googleapis.com/*",
+    "https://securetoken.googleapis.com/*",
+    "https://firestore.googleapis.com/*"
+  ],
+  "oauth2": {
+    "client_id": "41700231969-REPLACE_WITH_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/firebase"]
+  }
+}
