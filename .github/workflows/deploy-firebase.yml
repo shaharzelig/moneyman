@@ -1,0 +1,49 @@
+name: Deploy to Firebase Functions
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "patches/**"
+      - "functions/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/41700231969/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: stocky-github-actions@stocky-shahar.iam.gserviceaccount.com
+
+      - name: Install root dependencies and build
+        run: npm ci && npm run build
+
+      - name: Copy compiled output into functions
+        run: cp -r dst functions/dst
+
+      - name: Copy patches into functions directory
+        run: cp -r patches functions/patches
+
+      - name: Install functions dependencies (applies patches via postinstall)
+        run: npm ci
+        working-directory: functions
+
+      - name: Deploy functions to Firebase
+        run: npx firebase-tools@latest deploy --only functions --project stocky-shahar --non-interactive --force

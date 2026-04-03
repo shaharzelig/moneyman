@@ -1,0 +1,9 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "moneyman",
+      "ignore": ["node_modules"]
+    }
+  ]
+}

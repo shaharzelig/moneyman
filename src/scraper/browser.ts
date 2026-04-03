@@ -20,15 +20,20 @@ export const browserArgs = [
   // Reduce easy automation fingerprints used by anti-bot providers.
   "--disable-blink-features=AutomationControlled",
 ];
-export const browserExecutablePath =
-  config.options.scraping.puppeteerExecutablePath || undefined;
+export function browserExecutablePath(): string | undefined {
+  return (
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    config.options.scraping.puppeteerExecutablePath ||
+    undefined
+  );
+}
 
 const logger = createLogger("browser");
 
 export async function createBrowser(): Promise<Browser> {
   const options = {
     args: browserArgs,
-    executablePath: browserExecutablePath,
+    executablePath: browserExecutablePath(),
     // Hide the "Chrome is being controlled by automated software" marker.
     ignoreDefaultArgs: ["--enable-automation"],
   } satisfies PuppeteerLaunchOptions;
