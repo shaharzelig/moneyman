@@ -9,11 +9,18 @@ const POLL_INTERVAL_MINUTES = 0.5; // 30 seconds
 // ── Firebase REST helpers ────────────────────────────────────────────────────
 
 async function getFirebaseIdToken() {
-  // Get Google OAuth token from Chrome identity
+  // Get Google OAuth token from Chrome identity — try silent first, prompt only if needed
   const googleToken = await new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive: true }, (token) => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(token);
+    chrome.identity.getAuthToken({ interactive: false }, (token) => {
+      if (chrome.runtime.lastError || !token) {
+        // Non-interactive failed — try interactive (shows popup)
+        chrome.identity.getAuthToken({ interactive: true }, (token2) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(token2);
+        });
+      } else {
+        resolve(token);
+      }
     });
   });
 
@@ -94,7 +101,14 @@ async function firestorePatch(path, fields, idToken) {
 function firestoreDocToObject(fields) {
   const result = {};
   for (const [key, val] of Object.entries(fields || {})) {
-    result[key] = val.stringValue ?? val.booleanValue ?? val.integerValue ?? val.timestampValue ?? null;
+    if (val.stringValue !== undefined) result[key] = val.stringValue;
+    else if (val.booleanValue !== undefined) result[key] = val.booleanValue;
+    else if (val.integerValue !== undefined) result[key] = val.integerValue;
+    else if (val.timestampValue !== undefined) result[key] = val.timestampValue;
+    else {
+      console.warn('[firestoreDocToObject] unhandled field type for key', key, val);
+      result[key] = null;
+    }
   }
   return result;
 }
@@ -149,69 +163,67 @@ async function runCibusAuth(jobId, uid, idToken) {
     chrome.tabs.create({ url: PLUXEE_URL, active: true }, resolve);
   });
 
-  try {
-    // Wait for tab to fully load
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Tab load timeout')), 30000);
-      chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
-        if (tabId === tab.id && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
-    });
-
-    // Small delay for React hydration
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Inject credentials into login form
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: (username, password) => {
-        const userInput = document.querySelector('#user');
-        const passInput = document.querySelector('#password');
-        if (!userInput || !passInput) throw new Error('Login form fields #user / #password not found');
-        // Use native input setter to trigger React's synthetic events
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        nativeSetter.call(userInput, username);
-        userInput.dispatchEvent(new Event('input', { bubbles: true }));
-        nativeSetter.call(passInput, password);
-        passInput.dispatchEvent(new Event('input', { bubbles: true }));
-        // Submit
-        const form = userInput.closest('form');
-        if (form) form.requestSubmit();
-        else {
-          const btn = document.querySelector('button[type="submit"], input[type="submit"]');
-          if (btn) btn.click();
-        }
-      },
-      args: [creds.username, creds.password],
-    });
-
-    console.log('[cibus-auth] Credentials injected, waiting for OTP flow and token cookie...');
-    // Tab stays open — user enters OTP naturally in the Pluxee page
-
-    // Poll for the token cookie (up to 5 minutes)
-    const deadline = Date.now() + 5 * 60 * 1000;
-    let tokenCookie = null;
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000));
-      tokenCookie = await new Promise(resolve => {
-        chrome.cookies.get({ url: 'https://consumers.pluxee.co.il', name: PLUXEE_COOKIE_NAME }, resolve);
-      });
-      if (tokenCookie) {
-        console.log('[cibus-auth] Token cookie found');
-        break;
+  // Wait for tab to fully load
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Tab load timeout')), 30000);
+    chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
+      if (tabId === tab.id && info.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timeout);
+        resolve();
       }
-    }
+    });
+  });
 
-    if (!tokenCookie) throw new Error('Timed out waiting for Pluxee token cookie');
+  // Small delay for React hydration
+  await new Promise(r => setTimeout(r, 2000));
 
-    // Format as Set-Cookie string (format expected by israeli-bank-scrapers cibus.js)
+  // Inject credentials into login form
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (username, password) => {
+      const userInput = document.querySelector('#user');
+      const passInput = document.querySelector('#password');
+      if (!userInput || !passInput) throw new Error('Login form fields #user / #password not found');
+      // Use native input setter to trigger React's synthetic events
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      nativeSetter.call(userInput, username);
+      userInput.dispatchEvent(new Event('input', { bubbles: true }));
+      nativeSetter.call(passInput, password);
+      passInput.dispatchEvent(new Event('input', { bubbles: true }));
+      // Submit
+      const form = userInput.closest('form');
+      if (form) form.requestSubmit();
+      else {
+        const btn = document.querySelector('button[type="submit"], input[type="submit"]');
+        if (btn) btn.click();
+      }
+    },
+    args: [creds.username, creds.password],
+  });
+
+  console.log('[cibus-auth] Credentials injected, waiting for OTP flow and token cookie...');
+
+  // Save running job state so the alarm cycle can poll for the cookie
+  await chrome.storage.local.set({
+    runningJob: { jobId, uid, tabId: tab.id, deadline: Date.now() + 5 * 60 * 1000 },
+  });
+  // Return immediately — cookie polling happens in checkRunningJob on the next alarm ticks
+}
+
+// ── Cookie poll (called on each alarm tick while a job is in flight) ─────────
+
+async function checkRunningJob(runningJob, idToken) {
+  const { jobId, uid, tabId, deadline } = runningJob;
+
+  const tokenCookie = await new Promise(resolve => {
+    chrome.cookies.get({ url: 'https://consumers.pluxee.co.il', name: PLUXEE_COOKIE_NAME }, resolve);
+  });
+
+  if (tokenCookie) {
+    console.log('[cibus-auth] Token cookie found');
     const cookieStr = cookieToSetCookieString(tokenCookie);
 
-    // Save to Firestore
     await firestorePatch(`users/${uid}/scrapers/cibus`, {
       cookie: cookieStr,
       cookieSavedAt: new Date().toISOString(),
@@ -221,10 +233,25 @@ async function runCibusAuth(jobId, uid, idToken) {
     await firestorePatch(`users/${uid}/jobs/${jobId}`, { status: 'done' }, idToken);
     console.log('[cibus-auth] Cookie saved, job done');
 
-  } finally {
-    // Close the Pluxee tab
-    chrome.tabs.remove(tab.id).catch(() => {});
+    chrome.tabs.remove(tabId).catch(() => {});
+    await chrome.storage.local.remove('runningJob');
+    return;
   }
+
+  if (Date.now() > deadline) {
+    console.warn('[cibus-auth] Timed out waiting for OTP cookie');
+    await firestorePatch(`users/${uid}/jobs/${jobId}`, {
+      status: 'failed',
+      error: String('Timeout waiting for OTP'),
+    }, idToken);
+    await firestorePatch(`users/${uid}/scrapers/cibus`, { status: 'not_connected' }, idToken);
+
+    chrome.tabs.remove(tabId).catch(() => {});
+    await chrome.storage.local.remove('runningJob');
+    return;
+  }
+
+  console.log('[cibus-auth] Waiting for OTP... next check on next alarm tick');
 }
 
 // ── Main poll loop ───────────────────────────────────────────────────────────
@@ -242,6 +269,19 @@ async function pollJobs() {
     await writeHeartbeat(uid, idToken);
   } catch (e) {
     console.warn('[poll] Heartbeat failed (non-fatal):', e.message);
+  }
+
+  // Check if there's an in-progress auth job first
+  const { runningJob } = await chrome.storage.local.get('runningJob');
+  if (runningJob) {
+    try {
+      await checkRunningJob(runningJob, idToken);
+    } catch (e) {
+      console.error('[poll] checkRunningJob failed:', e.message);
+      // Clear storage to avoid being stuck
+      await chrome.storage.local.remove('runningJob');
+    }
+    return; // don't start new jobs while one is in flight
   }
 
   let jobs;
@@ -262,7 +302,7 @@ async function pollJobs() {
     } catch (e) {
       console.error('[poll] Auth flow failed for job', job.id, e.message);
       try {
-        await firestorePatch(`users/${uid}/jobs/${job.id}`, { status: 'failed', error: e.message }, idToken);
+        await firestorePatch(`users/${uid}/jobs/${job.id}`, { status: 'failed', error: String(e.message ?? e) }, idToken);
         await firestorePatch(`users/${uid}/scrapers/cibus`, { status: 'not_connected' }, idToken);
       } catch (_) {}
       chrome.notifications.create({
@@ -277,9 +317,13 @@ async function pollJobs() {
 
 // ── Extension lifecycle ──────────────────────────────────────────────────────
 
-chrome.alarms.create(ALARM_NAME, {
-  delayInMinutes: 0.1,  // first poll after 6 seconds
-  periodInMinutes: POLL_INTERVAL_MINUTES,
+chrome.alarms.get(ALARM_NAME, (alarm) => {
+  if (!alarm) {
+    chrome.alarms.create(ALARM_NAME, {
+      delayInMinutes: 0.1,  // first poll after 6 seconds
+      periodInMinutes: POLL_INTERVAL_MINUTES,
+    });
+  }
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
