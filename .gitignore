@@ -9,3 +9,4 @@ config.jsonc
 local_config/
 dst/
 output
+.superpowers/
