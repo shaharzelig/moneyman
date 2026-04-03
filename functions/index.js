@@ -5,6 +5,39 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import chromium from '@sparticuz/chromium';
 import { readFileSync } from 'fs';
 
+async function telegramOtpRetriever(apiKey, chatId) {
+  const baseUrl = `https://api.telegram.org/bot${apiKey}`;
+
+  // Send OTP request message
+  await fetch(`${baseUrl}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: '🔐 Cibus OTP required. Please reply with the code you received via SMS.' }),
+  });
+
+  // Get current update offset so we only read new messages
+  const offsetRes = await fetch(`${baseUrl}/getUpdates?limit=1&offset=-1`);
+  const offsetData = await offsetRes.json();
+  let offset = offsetData.result?.length ? offsetData.result[0].update_id + 1 : 0;
+
+  // Poll for reply (up to 4 minutes)
+  const deadline = Date.now() + 4 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const res = await fetch(`${baseUrl}/getUpdates?offset=${offset}&timeout=20&allowed_updates=["message"]`);
+    const data = await res.json();
+    for (const update of (data.result || [])) {
+      offset = update.update_id + 1;
+      const text = update.message?.text?.trim();
+      const fromChatId = String(update.message?.chat?.id);
+      if (fromChatId === String(chatId) && /^\d{4,8}$/.test(text)) {
+        console.log('Received OTP from Telegram');
+        return text;
+      }
+    }
+  }
+  throw new Error('OTP timeout: no code received within 4 minutes');
+}
+
 if (!getApps().length) {
   initializeApp();
 }
@@ -58,6 +91,13 @@ async function runMoneyman() {
       });
       console.log('Saved new cibus session cookie to Firestore');
     };
+    const tg = configDoc.data()?.options?.notifications?.telegram;
+    if (tg?.apiKey && tg?.chatId) {
+      cibusAccount.otpCodeRetriever = () => telegramOtpRetriever(tg.apiKey, tg.chatId);
+      console.log('[5] otpCodeRetriever configured via Telegram');
+    } else {
+      console.log('[5] WARNING: no Telegram config found, OTP retrieval will fail');
+    }
   } else {
     console.log('[5] WARNING: no cibus account found in scraperConfig');
   }
