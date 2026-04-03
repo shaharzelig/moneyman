@@ -309,7 +309,7 @@ async function pollJobs() {
         type: 'basic',
         iconUrl: 'icon.png',
         title: 'Cibus auth failed',
-        message: e.message,
+        message: String(e.message ?? e),
       });
     }
   }
@@ -327,5 +327,5 @@ chrome.alarms.get(ALARM_NAME, (alarm) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) pollJobs();
+  if (alarm.name === ALARM_NAME) pollJobs().catch(e => console.error('[poll] Unhandled error:', e));
 });
