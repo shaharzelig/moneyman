@@ -77,7 +77,7 @@ async function runMoneyman() {
         },
       );
       console.log('[6] scrapeAccounts done:', JSON.stringify(results?.map(r => ({
-        companyId: r.companyId, success: r.result?.success, errorType: r.result?.errorType, errorMessage: r.result?.errorMessage,
+        companyId: r.companyId, success: r.result?.success, errorType: r.result?.errorType,
       }))));
 
       // Check if Cibus specifically failed with auth error
@@ -143,13 +143,19 @@ export const runMoneymanHttp = onRequest(
       res.status(401).send('Unauthorized');
       return;
     }
+    if (!process.env.OWNER_UID) {
+      console.error('OWNER_UID environment variable is not set');
+      res.status(500).send('Internal Server Error');
+      return;
+    }
     try {
       const decoded = await getAuth().verifyIdToken(idToken);
       if (decoded.uid !== process.env.OWNER_UID) {
         res.status(403).send('Forbidden');
         return;
       }
-    } catch {
+    } catch (e) {
+      console.warn('verifyIdToken failed:', e?.code ?? e?.message);
       res.status(401).send('Unauthorized');
       return;
     }
