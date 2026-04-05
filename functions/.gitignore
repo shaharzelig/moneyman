@@ -1,3 +1,4 @@
 patches/
 node_modules/
 dst/
+.env
