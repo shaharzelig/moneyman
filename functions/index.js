@@ -1,5 +1,6 @@
 import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { onRequest } from 'firebase-functions/v2/https';
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
@@ -117,6 +118,25 @@ async function runMoneyman() {
 
   console.log('[8] runWithStorage complete');
 }
+
+export const runMoneymanOnRequest = onDocumentWritten(
+  { document: 'moneyman/scrapeRequest', region: 'me-west1', memory: '4GiB', timeoutSeconds: 540, maxInstances: 1 },
+  async (event) => {
+    const after = event.data?.after;
+    if (!after?.exists) return;
+    if (after.data().status !== 'pending') return;
+
+    const db = getFirestore();
+    await db.doc('moneyman/scrapeRequest').update({ status: 'running', startedAt: FieldValue.serverTimestamp() });
+    try {
+      await runMoneyman();
+      await db.doc('moneyman/scrapeRequest').update({ status: 'done', completedAt: FieldValue.serverTimestamp() });
+    } catch (e) {
+      console.error('runMoneyman failed:', e);
+      await db.doc('moneyman/scrapeRequest').update({ status: 'failed', error: String(e), completedAt: FieldValue.serverTimestamp() });
+    }
+  },
+);
 
 export const runMoneymanScheduled = onSchedule(
   {
