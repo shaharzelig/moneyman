@@ -2,6 +2,7 @@ import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { onRequest } from 'firebase-functions/v2/https';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+import { getAuth } from 'firebase-admin/auth';
 import chromium from '@sparticuz/chromium';
 
 if (!getApps().length) {
@@ -76,7 +77,7 @@ async function runMoneyman() {
         },
       );
       console.log('[6] scrapeAccounts done:', JSON.stringify(results?.map(r => ({
-        companyId: r.companyId, success: r.result?.success, errorType: r.result?.errorType,
+        companyId: r.companyId, success: r.result?.success, errorType: r.result?.errorType, errorMessage: r.result?.errorMessage,
       }))));
 
       // Check if Cibus specifically failed with auth error
@@ -132,8 +133,27 @@ export const runMoneymanHttp = onRequest(
     memory: '4GiB',
     timeoutSeconds: 540,
     region: 'me-west1',
+    maxInstances: 1,
   },
   async (req, res) => {
+    // Auth guard — must be first, before any expensive work
+    const authHeader = req.headers.authorization ?? '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      res.status(401).send('Unauthorized');
+      return;
+    }
+    try {
+      const decoded = await getAuth().verifyIdToken(idToken);
+      if (decoded.uid !== process.env.OWNER_UID) {
+        res.status(403).send('Forbidden');
+        return;
+      }
+    } catch {
+      res.status(401).send('Unauthorized');
+      return;
+    }
+
     try {
       await runMoneyman();
       res.send('OK');
