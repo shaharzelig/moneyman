@@ -38,10 +38,11 @@ async function runMoneymanForUser(uid) {
   const patchedAccounts = await Promise.all(
     accounts.map(async (account) => {
       const sessionDoc = await db.doc(`users/${uid}/scrapers/${account.companyId}`).get();
-      if (!sessionDoc.exists) return account;
-      const session = sessionDoc.data();
       const patched = { ...account };
-      if (session.cookie) patched.cookie = session.cookie;
+      if (sessionDoc.exists) {
+        const session = sessionDoc.data();
+        if (session.cookie) patched.cookie = session.cookie;
+      }
       patched.onCookieSaved = async (newCookie) => {
         await db.doc(`users/${uid}/scrapers/${account.companyId}`).set(
           { cookie: newCookie, cookieSavedAt: FieldValue.serverTimestamp(), status: 'connected' },
@@ -102,9 +103,19 @@ async function runMoneymanForUser(uid) {
   // Save transactions to users/{uid}/transactions/{hash}
   const txns = resultsToTransactions(results);
   if (txns.length > 0) {
-    await storage.saveTransactions(txns, async (msg) => {
-      console.log(`[${uid}] storage: ${msg}`);
-    });
+    try {
+      await storage.saveTransactions(txns, async (msg) => {
+        console.log(`[${uid}] storage: ${msg}`);
+      });
+    } catch (e) {
+      console.error(`[${uid}] saveTransactions failed:`, e?.message);
+      await runRef.update({
+        status: 'failed',
+        completedAt: FieldValue.serverTimestamp(),
+        error: `saveTransactions: ${String(e?.message ?? e)}`,
+      });
+      throw e;
+    }
   }
 
   // Build per-account summary for run document
@@ -170,10 +181,21 @@ export const runMoneymanScheduled = onSchedule(
     for (const configDoc of configDocs) {
       // Path format: users/{uid}/moneyman/config → uid is path segment at index 1
       const uid = configDoc.ref.path.split('/')[1];
-      await db.doc(`users/${uid}/moneyman/scrapeRequest`).set({
-        status: 'pending',
-        requestedAt: FieldValue.serverTimestamp(),
-        triggeredBy: 'schedule',
+      const scrapeRef = db.doc(`users/${uid}/moneyman/scrapeRequest`);
+      await db.runTransaction(async (tx) => {
+        const existing = await tx.get(scrapeRef);
+        if (existing.exists) {
+          const status = existing.data().status;
+          if (status === 'pending' || status === 'running') {
+            console.log(`[${uid}] Skipping fan-out — scrapeRequest already ${status}`);
+            return;
+          }
+        }
+        tx.set(scrapeRef, {
+          status: 'pending',
+          requestedAt: FieldValue.serverTimestamp(),
+          triggeredBy: 'schedule',
+        });
       });
       console.log(`Fan-out: created scrapeRequest for ${uid}`);
     }
