@@ -36,7 +36,12 @@ describe('FirestoreStorage', () => {
     mockDb.getAll.mockResolvedValue([{ exists: false }]);
   });
 
+  afterEach(() => {
+    delete process.env.FIREBASE_CONFIG;
+  });
+
   it('writes transactions to users/{uid}/transactions collection', async () => {
+    process.env.FIREBASE_CONFIG = '{}';
     const storage = new FirestoreStorage(uid);
     const tx = transactionRow({ status: TransactionStatuses.Completed });
     await storage.saveTransactions([tx], async () => {});
@@ -47,6 +52,5 @@ describe('FirestoreStorage', () => {
     process.env.FIREBASE_CONFIG = '{}';
     const storage = new FirestoreStorage(uid);
     expect(storage.canSave()).toBe(true);
-    delete process.env.FIREBASE_CONFIG;
   });
 });

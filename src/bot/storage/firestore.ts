@@ -19,6 +19,9 @@ export class FirestoreStorage implements TransactionStorage {
     txns: Array<TransactionRow>,
     onProgress: (status: string) => Promise<void>,
   ): Promise<SaveStats> {
+    if (!this.canSave()) {
+      throw new Error("FirestoreStorage: Firebase Admin not initialized");
+    }
     const { getFirestore, FieldValue } = await import(
       "firebase-admin/firestore"
     );

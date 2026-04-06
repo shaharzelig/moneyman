@@ -38,7 +38,6 @@ export const storages = [
   new ActualBudgetStorage(config),
   new SqlStorage(config),
   new MoneymanDashStorage(config),
-  new FirestoreStorage(),
 ].filter((s) => s.canSave());
 
 export async function saveResults(results: Array<AccountScrapeResult>) {
