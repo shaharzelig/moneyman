@@ -22,11 +22,12 @@ import { TelegramStorage } from "./telegram.js";
 import { YNABStorage } from "./ynab.js";
 import { SqlStorage } from "./sql.js";
 import { MoneymanDashStorage } from "./moneyman.js";
-import { FirestoreStorage } from "./firestore.js";
 import { config } from "../../config.js";
 
 const baseLogger = createLogger("storage");
 
+// FirestoreStorage is excluded here — the Cloud Function creates it directly
+// per-user with new FirestoreStorage(uid). Local/Docker runs don't use Firestore.
 export const storages = [
   new LocalJsonStorage(config),
   new GoogleSheetsStorage(config),
@@ -101,7 +102,7 @@ export async function saveResults(results: Array<AccountScrapeResult>) {
   );
 }
 
-function resultsToTransactions(
+export function resultsToTransactions(
   results: Array<AccountScrapeResult>,
 ): Array<TransactionRow> {
   const txns: Array<TransactionRow> = [];
@@ -123,10 +124,6 @@ function resultsToTransactions(
               ),
             });
           } catch (error) {
-            // Skip transactions that fail hash generation and report the error
-            // Note: The full transaction object is intentionally included for debugging
-            // purposes as requested in the issue. This is sent via Telegram to help
-            // diagnose malformed transactions.
             sendError(
               error,
               `Failed to process transaction for ${companyId} account ${account.accountNumber}:\n${JSON.stringify(tx, null, 2)}`,
