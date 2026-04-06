@@ -6,9 +6,9 @@ import { TransactionStatuses } from "israeli-bank-scrapers/lib/transactions.js";
 
 const logger = createLogger("FirestoreStorage");
 
-const COLLECTION = "moneymanTransactions";
-
 export class FirestoreStorage implements TransactionStorage {
+  constructor(private uid: string) {}
+
   // FIREBASE_CONFIG is automatically set by the Cloud Functions runtime.
   // It is not present in local/Docker runs, so canSave() returns false there.
   canSave(): boolean {
@@ -19,15 +19,12 @@ export class FirestoreStorage implements TransactionStorage {
     txns: Array<TransactionRow>,
     onProgress: (status: string) => Promise<void>,
   ): Promise<SaveStats> {
-    if (!this.canSave()) {
-      throw new Error("FirestoreStorage: Firebase Admin not initialized");
-    }
-
     const { getFirestore, FieldValue } = await import(
       "firebase-admin/firestore"
     );
     const db = getFirestore();
-    const stats = createSaveStats("Firestore", COLLECTION, txns);
+    const collection = `users/${this.uid}/transactions`;
+    const stats = createSaveStats("Firestore", collection, txns);
 
     const settledTxns = txns.filter(
       (tx) => tx.status !== TransactionStatuses.Pending,
@@ -38,7 +35,7 @@ export class FirestoreStorage implements TransactionStorage {
     const BATCH_SIZE = 500;
     for (let i = 0; i < settledTxns.length; i += BATCH_SIZE) {
       const chunk = settledTxns.slice(i, i + BATCH_SIZE);
-      const refs = chunk.map((tx) => db.collection(COLLECTION).doc(tx.hash));
+      const refs = chunk.map((tx) => db.collection(collection).doc(tx.hash));
       const snaps = await db.getAll(...refs);
       const batch = db.batch();
       let batchCount = 0;
@@ -49,7 +46,12 @@ export class FirestoreStorage implements TransactionStorage {
         if (snap.exists) {
           stats.existing++;
         } else {
-          batch.set(snap.ref, { ...tx, savedAt: FieldValue.serverTimestamp() });
+          const doc = Object.fromEntries(
+            Object.entries({ ...tx, savedAt: FieldValue.serverTimestamp() }).filter(
+              ([, v]) => v !== undefined,
+            ),
+          );
+          batch.set(snap.ref, doc);
           stats.added++;
           batchCount++;
         }
