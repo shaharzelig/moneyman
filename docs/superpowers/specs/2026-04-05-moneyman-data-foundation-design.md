@@ -53,7 +53,7 @@ Make moneyman multi-tenant. Each approved Stocky user can scrape their own bank 
 
 **Schedule:** `0 0 * * *` (midnight UTC — changed from `"every 24 hours"`)
 
-Does not scrape. Discovers all moneyman users via a Firestore **collection group query** on the `moneyman` subcollection filtered to documents with ID `config`. For each user found, writes `{ status: 'pending', requestedAt: serverTimestamp() }` to `users/{uid}/moneyman/scrapeRequest`. This triggers `runMoneymanOnRequest` independently per user.
+Does not scrape. Discovers all moneyman users via a Firestore **collection group query** on the `moneyman` collection. The query returns all documents across all users' `moneyman` collections (`config` and `scrapeRequest`); filter in application code to documents where the document ID is `config`. For each user found, extract the `uid` from the document's resource path, then write `{ status: 'pending', requestedAt: serverTimestamp() }` to `users/{uid}/moneyman/scrapeRequest`. This triggers `runMoneymanOnRequest` independently per user.
 
 ### 2. `runMoneymanOnRequest` (Firestore trigger)
 
@@ -124,8 +124,8 @@ All moneyman data is gated behind `isApproved()` — only users you have approve
 
 ## Frontend Changes (BankConnections.tsx)
 
-- Config subscription: `moneyman/config` → `users/{uid}/moneyman/config`
-- ScrapeRequest path: `moneyman/scrapeRequest` → `users/{uid}/moneyman/scrapeRequest`
+- Config path (reads and writes): `moneyman/config` → `users/{uid}/moneyman/config`
+- ScrapeRequest path (reads and writes): `moneyman/scrapeRequest` → `users/{uid}/moneyman/scrapeRequest`
 - Show latest run status from `users/{uid}/moneyman/config/runs` (most recent doc, ordered by `startedAt` desc)
 - Show next scheduled run: **next midnight UTC** (computed client-side — reliable since schedule is now fixed to `0 0 * * *`)
 
