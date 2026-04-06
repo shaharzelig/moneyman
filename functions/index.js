@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { onRequest } from 'firebase-functions/v2/https';
 import { onDocumentWritten } from 'firebase-functions/v2/firestore';
@@ -6,163 +7,232 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import chromium from '@sparticuz/chromium';
 
-if (!getApps().length) {
-  initializeApp();
-}
+if (!getApps().length) initializeApp();
 
-async function runMoneyman() {
-  console.log('[1] Setting chromium executable path');
+// Error types that indicate a scraper needs re-authentication via the extension flow
+const AUTH_FAILURE_ERRORS = [
+  'InvalidPassword',
+  'ChangePasswordError',
+  'AccountBlocked',
+  'TWO_FACTOR_RETRIEVER_MISSING',
+];
+
+// ── Per-user scrape runner ────────────────────────────────────────────────────
+
+async function runMoneymanForUser(uid) {
+  console.log(`[${uid}] Starting scrape`);
+  const db = getFirestore();
+  const runId = randomUUID();
+  const runRef = db.doc(`users/${uid}/moneyman/config/runs/${runId}`);
+
+  // Chromium must be configured before the scraper imports browser.js
   process.env.PUPPETEER_EXECUTABLE_PATH = await chromium.executablePath();
 
-  const db = getFirestore();
-
-  console.log('[2] Loading config from Firestore');
-  const configDoc = await db.doc('moneyman/config').get();
-  if (!configDoc.exists) {
-    throw new Error('Firestore document moneyman/config not found.');
-  }
+  // Read user's moneyman config from Firestore
+  const configDoc = await db.doc(`users/${uid}/moneyman/config`).get();
+  if (!configDoc.exists) throw new Error(`No moneyman config for user ${uid}`);
   const configData = configDoc.data();
-  const uid = configData.uid;
-  if (!uid) {
-    throw new Error('moneyman/config is missing the "uid" field. Add your Firebase UID.');
-  }
-  process.env.MONEYMAN_CONFIG = JSON.stringify(configData);
-  console.log('[2] MONEYMAN_CONFIG set, uid:', uid, 'accounts:', configData.accounts?.map(a => a.companyId));
+  const accounts = configData.accounts ?? [];
 
-  console.log('[3] Loading cibus session cookie from users/{uid}/scrapers/cibus');
-  const cibusDoc = await db.doc(`users/${uid}/scrapers/cibus`).get();
-  const savedCookie = cibusDoc.exists ? cibusDoc.data().cookie : null;
-  const cibusStatus = cibusDoc.exists ? cibusDoc.data().status : 'not_connected';
-  console.log('[3] cibus status:', cibusStatus, '| cookie:', savedCookie ? 'found' : 'not found');
+  // Load saved scraper sessions (e.g. cookies) and register onCookieSaved callbacks
+  const patchedAccounts = await Promise.all(
+    accounts.map(async (account) => {
+      const sessionDoc = await db.doc(`users/${uid}/scrapers/${account.companyId}`).get();
+      if (!sessionDoc.exists) return account;
+      const session = sessionDoc.data();
+      const patched = { ...account };
+      if (session.cookie) patched.cookie = session.cookie;
+      patched.onCookieSaved = async (newCookie) => {
+        await db.doc(`users/${uid}/scrapers/${account.companyId}`).set(
+          { cookie: newCookie, cookieSavedAt: FieldValue.serverTimestamp(), status: 'connected' },
+          { merge: true },
+        );
+        console.log(`[${uid}] Saved new session cookie for ${account.companyId}`);
+      };
+      return patched;
+    }),
+  );
 
-  console.log('[4] Dynamically importing moneyman modules');
-  const { scraperConfig } = await import('./dst/config.js');
-  const { runWithStorage } = await import('./dst/bot/index.js');
+  // Create run document (replaces Telegram "Starting..." message)
+  await runRef.set({ status: 'running', startedAt: FieldValue.serverTimestamp() });
+
+  // Build ScraperConfig directly from Firestore data.
+  // Do NOT use the scraperConfig module (it reads MONEYMAN_CONFIG at import time
+  // and is cached — unusable in a multi-user context).
+  const daysBack = configData.options?.scraping?.daysBack ?? 90;
+  const scraperConfig = {
+    accounts: patchedAccounts,
+    startDate: new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000),
+    parallelScrapers: configData.options?.scraping?.maxParallelScrapers ?? 1,
+    futureMonthsToScrape: configData.options?.scraping?.futureMonths ?? 1,
+    additionalTransactionInformation: configData.options?.scraping?.additionalTransactionInfo ?? false,
+    includeRawTransaction: false,
+  };
+
+  // Dynamic imports are cached per-invocation (each Cloud Function invocation is
+  // its own process, so there is no cross-user cache pollution).
   const { scrapeAccounts } = await import('./dst/scraper/index.js');
-  const { sendFailureScreenShots } = await import('./dst/utils/failureScreenshot.js');
+  const { FirestoreStorage } = await import('./dst/bot/storage/firestore.js');
+  const { resultsToTransactions } = await import('./dst/bot/storage/index.js');
 
-  console.log('[5] Patching cibus account credentials');
-  const cibusAccount = scraperConfig.accounts.find(a => a.companyId === 'cibus');
-  if (cibusAccount) {
-    if (savedCookie) {
-      cibusAccount.cookie = savedCookie;
-      console.log('[5] Loaded saved cibus session cookie');
-    } else {
-      console.log('[5] No cibus session cookie — will attempt credential login (likely to fail on cloud IP)');
-    }
-    cibusAccount.onCookieSaved = async (newCookie) => {
-      await db.doc(`users/${uid}/scrapers/cibus`).set({
-        cookie: newCookie,
-        cookieSavedAt: FieldValue.serverTimestamp(),
-        status: 'connected',
-      }, { merge: true });
-      console.log('[5] Saved new cibus session cookie to Firestore');
-    };
-    // No otpCodeRetriever — cookie-based auth is the only cloud-compatible flow
+  const storage = new FirestoreStorage(uid);
+
+  let results;
+  try {
+    results = await scrapeAccounts(
+      scraperConfig,
+      async (status, totalTime) => {
+        const line = status.join(' | ');
+        console.log(`[${uid}] ${totalTime ? `Done in ${totalTime.toFixed(1)}s` : line}`);
+      },
+      (e, caller) => {
+        console.error(`[${uid}] scraper error [${caller}]:`, e?.message);
+      },
+    );
+  } catch (e) {
+    console.error(`[${uid}] scrapeAccounts threw:`, e?.message);
+    await runRef.update({
+      status: 'failed',
+      completedAt: FieldValue.serverTimestamp(),
+      error: String(e?.message ?? e),
+    });
+    throw e;
   }
 
-  console.log('[6] Running scraper via runWithStorage');
-  let cibusAuthFailed = false;
-  await runWithStorage(async (hooks) => {
-    try {
-      await hooks.onBeforeStart();
-      const results = await scrapeAccounts(
-        scraperConfig,
-        async (status, totalTime) => hooks.onStatusChanged(status, totalTime),
-        (e, caller) => {
-          console.error('[6] scraper onError:', caller, e?.message);
-          if (caller === 'cibus') {
-            cibusAuthFailed = true;
-          }
-          hooks.onError(e, caller);
-        },
-      );
-      console.log('[6] scrapeAccounts done:', JSON.stringify(results?.map(r => ({
-        companyId: r.companyId, success: r.result?.success, errorType: r.result?.errorType,
-      }))));
+  // Save transactions to users/{uid}/transactions/{hash}
+  const txns = resultsToTransactions(results);
+  if (txns.length > 0) {
+    await storage.saveTransactions(txns, async (msg) => {
+      console.log(`[${uid}] storage: ${msg}`);
+    });
+  }
 
-      // Check if Cibus specifically failed with auth error
-      const cibusResult = results?.find(r => r.companyId === 'cibus');
-      if (cibusResult && !cibusResult.result?.success) {
-        const errorType = cibusResult.result?.errorType;
-        if (['InvalidPassword', 'ChangePasswordError', 'AccountBlocked', 'TWO_FACTOR_RETRIEVER_MISSING'].includes(errorType)) {
-          cibusAuthFailed = true;
-        }
-      }
+  // Build per-account summary for run document
+  const accountSummary = results.map((r) => ({
+    companyId: r.companyId,
+    success: r.result.success,
+    txnCount: r.result.accounts?.reduce((sum, a) => sum + (a.txns?.length ?? 0), 0) ?? 0,
+    ...(r.result.errorType ? { errorType: r.result.errorType } : {}),
+  }));
 
-      await Promise.all([
-        hooks.onResultsReady(results),
-        sendFailureScreenShots(hooks.failureScreenshotsHandler),
-      ]);
-    } catch (e) {
-      console.error('[6] runMoneyman catch:', e?.message);
-      await hooks.onError(e, 'runMoneyman');
-    }
+  // Update run document (replaces Telegram summary message)
+  await runRef.update({
+    status: 'done',
+    completedAt: FieldValue.serverTimestamp(),
+    txnCount: txns.length,
+    accounts: accountSummary,
   });
 
-  // If Cibus auth failed, create a job for the extension and notify user
-  if (cibusAuthFailed) {
-    console.log('[7] Cibus auth failed — creating extension auth job');
-    await db.collection(`users/${uid}/jobs`).add({
-      type: 'auth',
-      scraper: 'cibus',
-      status: 'pending',
-      createdAt: FieldValue.serverTimestamp(),
-    });
-    await db.doc(`users/${uid}/scrapers/cibus`).set(
-      { status: 'expired' },
-      { merge: true }
-    );
-    console.log('[7] Auth job created. User should open Stocky to re-authenticate.');
+  // Create re-auth jobs for scrapers that use session-based auth and failed
+  for (const r of results) {
+    if (!r.result.success && AUTH_FAILURE_ERRORS.includes(r.result.errorType)) {
+      const account = patchedAccounts.find((a) => a.companyId === r.companyId);
+      if (account?.cookie !== undefined) {
+        // This scraper uses session/cookie auth — create a job for the extension
+        await db.collection(`users/${uid}/jobs`).add({
+          type: 'auth',
+          scraper: r.companyId,
+          status: 'pending',
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        await db.doc(`users/${uid}/scrapers/${r.companyId}`).set(
+          { status: 'expired' },
+          { merge: true },
+        );
+        console.log(`[${uid}] Created re-auth job for ${r.companyId}`);
+      }
+    }
   }
 
-  console.log('[8] runWithStorage complete');
+  console.log(`[${uid}] Scrape complete. ${txns.length} transactions saved.`);
 }
 
+// ── Cloud Function exports ────────────────────────────────────────────────────
+
+// Scheduled: discover all moneyman users and fan out a scrapeRequest per user.
+// Each scrapeRequest triggers runMoneymanOnRequest independently.
+export const runMoneymanScheduled = onSchedule(
+  {
+    schedule: '0 0 * * *', // daily at midnight UTC
+    memory: '512MiB',
+    timeoutSeconds: 60,
+    region: 'me-west1',
+  },
+  async () => {
+    const db = getFirestore();
+    // Collection group query finds all documents in any 'moneyman' subcollection.
+    // Filter in code to those with document ID 'config' (i.e. the config docs, not scrapeRequest).
+    const snapshot = await db.collectionGroup('moneyman').get();
+    const configDocs = snapshot.docs.filter((doc) => doc.id === 'config');
+
+    console.log(`Fan-out: found ${configDocs.length} moneyman user(s)`);
+
+    for (const configDoc of configDocs) {
+      // Path format: users/{uid}/moneyman/config → uid is path segment at index 1
+      const uid = configDoc.ref.path.split('/')[1];
+      await db.doc(`users/${uid}/moneyman/scrapeRequest`).set({
+        status: 'pending',
+        requestedAt: FieldValue.serverTimestamp(),
+        triggeredBy: 'schedule',
+      });
+      console.log(`Fan-out: created scrapeRequest for ${uid}`);
+    }
+  },
+);
+
+// Firestore trigger: fires for any user's scrapeRequest (wildcard {uid}).
+// Each invocation is fully isolated — separate process, memory, and timeout.
 export const runMoneymanOnRequest = onDocumentWritten(
-  { document: 'moneyman/scrapeRequest', region: 'me-west1', memory: '4GiB', timeoutSeconds: 540, maxInstances: 1 },
+  {
+    document: 'users/{uid}/moneyman/scrapeRequest',
+    region: 'me-west1',
+    memory: '4GiB',
+    timeoutSeconds: 540,
+    maxInstances: 5,
+  },
   async (event) => {
+    const uid = event.params.uid;
     const after = event.data?.after;
     if (!after?.exists) return;
     if (after.data().status !== 'pending') return;
 
     const db = getFirestore();
-    await db.doc('moneyman/scrapeRequest').update({ status: 'running', startedAt: FieldValue.serverTimestamp() });
+    await db.doc(`users/${uid}/moneyman/scrapeRequest`).update({
+      status: 'running',
+      startedAt: FieldValue.serverTimestamp(),
+    });
+
     try {
-      await runMoneyman();
-      await db.doc('moneyman/scrapeRequest').update({ status: 'done', completedAt: FieldValue.serverTimestamp() });
+      await runMoneymanForUser(uid);
+      await db.doc(`users/${uid}/moneyman/scrapeRequest`).update({
+        status: 'done',
+        completedAt: FieldValue.serverTimestamp(),
+      });
     } catch (e) {
-      console.error('runMoneyman failed:', e);
-      await db.doc('moneyman/scrapeRequest').update({ status: 'failed', error: String(e), completedAt: FieldValue.serverTimestamp() });
+      console.error(`[${uid}] runMoneymanForUser failed:`, e);
+      await db.doc(`users/${uid}/moneyman/scrapeRequest`).update({
+        status: 'failed',
+        error: String(e?.message ?? e),
+        completedAt: FieldValue.serverTimestamp(),
+      });
     }
   },
 );
 
-export const runMoneymanScheduled = onSchedule(
-  {
-    schedule: 'every 24 hours',
-    memory: '4GiB',
-    timeoutSeconds: 540,
-    region: 'me-west1',
-  },
-  runMoneyman,
-);
-
+// HTTP: admin-only debug trigger. Writes a scrapeRequest for the given uid,
+// which triggers runMoneymanOnRequest. Auth guard requires the owner's Firebase ID token.
 export const runMoneymanHttp = onRequest(
   {
-    memory: '4GiB',
-    timeoutSeconds: 540,
+    memory: '256MiB',
+    timeoutSeconds: 60,
     region: 'me-west1',
     maxInstances: 1,
   },
   async (req, res) => {
-    // Auth guard — must be first, before any expensive work
+    // Auth guard — must be first
     const authHeader = req.headers.authorization ?? '';
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-    if (!idToken) {
-      res.status(401).send('Unauthorized');
-      return;
-    }
+    if (!idToken) { res.status(401).send('Unauthorized'); return; }
     if (!process.env.OWNER_UID) {
       console.error('OWNER_UID environment variable is not set');
       res.status(500).send('Internal Server Error');
@@ -170,22 +240,20 @@ export const runMoneymanHttp = onRequest(
     }
     try {
       const decoded = await getAuth().verifyIdToken(idToken);
-      if (decoded.uid !== process.env.OWNER_UID) {
-        res.status(403).send('Forbidden');
-        return;
-      }
+      if (decoded.uid !== process.env.OWNER_UID) { res.status(403).send('Forbidden'); return; }
     } catch (e) {
       console.warn('verifyIdToken failed:', e?.code ?? e?.message);
       res.status(401).send('Unauthorized');
       return;
     }
 
-    try {
-      await runMoneyman();
-      res.send('OK');
-    } catch (e) {
-      console.error('runMoneyman failed:', e);
-      res.status(500).send(String(e));
-    }
+    const uid = req.body?.uid ?? process.env.OWNER_UID;
+    const db = getFirestore();
+    await db.doc(`users/${uid}/moneyman/scrapeRequest`).set({
+      status: 'pending',
+      requestedAt: FieldValue.serverTimestamp(),
+      triggeredBy: 'http',
+    });
+    res.send(`OK — scrapeRequest created for ${uid}`);
   },
 );
