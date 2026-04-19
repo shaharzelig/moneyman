@@ -60,10 +60,10 @@ async function runMoneymanForUser(uid, { daysBackOverride } = {}) {
   const existingRuns = await db
     .collection(`users/${uid}/moneyman/config/runs`)
     .orderBy('startedAt', 'desc')
-    .limit(20)
+    .limit(21)
     .get();
   if (existingRuns.size >= 20) {
-    await existingRuns.docs[existingRuns.docs.length - 1].ref.delete();
+    await Promise.all(existingRuns.docs.slice(19).map(doc => doc.ref.delete()));
   }
 
   // Create run document
