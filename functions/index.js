@@ -19,11 +19,13 @@ const AUTH_FAILURE_ERRORS = [
 
 // ── Per-user scrape runner ────────────────────────────────────────────────────
 
-async function runMoneymanForUser(uid) {
+async function runMoneymanForUser(uid, { daysBackOverride } = {}) {
   console.log(`[${uid}] Starting scrape`);
   const db = getFirestore();
   const runId = randomUUID();
   const runRef = db.doc(`users/${uid}/moneyman/config/runs/${runId}`);
+  const startTime = Date.now();
+  const logs = [];
 
   // Chromium must be configured before the scraper imports browser.js
   process.env.PUPPETEER_EXECUTABLE_PATH = await chromium.executablePath();
@@ -54,13 +56,22 @@ async function runMoneymanForUser(uid) {
     }),
   );
 
-  // Create run document (replaces Telegram "Starting..." message)
+  // Enforce 20-run cap: delete oldest if already at 20
+  const existingRuns = await db
+    .collection(`users/${uid}/moneyman/config/runs`)
+    .orderBy('startedAt', 'desc')
+    .limit(20)
+    .get();
+  if (existingRuns.size >= 20) {
+    await existingRuns.docs[existingRuns.docs.length - 1].ref.delete();
+  }
+
+  // Create run document
   await runRef.set({ status: 'running', startedAt: FieldValue.serverTimestamp() });
 
-  // Build ScraperConfig directly from Firestore data.
-  // Do NOT use the scraperConfig module (it reads MONEYMAN_CONFIG at import time
-  // and is cached — unusable in a multi-user context).
-  const daysBack = configData.options?.scraping?.daysBack ?? 90;
+  const daysBack = daysBackOverride ?? configData.options?.scraping?.daysBack ?? 90;
+  logs.push(`Starting scrape for ${patchedAccounts.length} account(s)`);
+
   const scraperConfig = {
     accounts: patchedAccounts,
     startDate: new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000),
@@ -70,8 +81,6 @@ async function runMoneymanForUser(uid) {
     includeRawTransaction: false,
   };
 
-  // Dynamic imports are cached per-invocation (each Cloud Function invocation is
-  // its own process, so there is no cross-user cache pollution).
   const { scrapeAccounts } = await import('./dst/scraper/index.js');
   const { FirestoreStorage } = await import('./dst/bot/storage/firestore.js');
   const { resultsToTransactions } = await import('./dst/bot/storage/index.js');
@@ -91,47 +100,72 @@ async function runMoneymanForUser(uid) {
       },
     );
   } catch (e) {
+    const msg = String(e?.message ?? e);
+    logs.push(`scrapeAccounts failed: ${msg}`);
     console.error(`[${uid}] scrapeAccounts threw:`, e?.message);
     await runRef.update({
       status: 'failed',
       completedAt: FieldValue.serverTimestamp(),
-      error: String(e?.message ?? e),
+      error: msg,
+      logs,
     });
     throw e;
   }
 
+  // Log per-account results
+  for (const r of results) {
+    if (r.result.success) {
+      const txnCount = r.result.accounts?.reduce((sum, a) => sum + (a.txns?.length ?? 0), 0) ?? 0;
+      logs.push(`[${r.companyId}] OK — ${txnCount} transactions`);
+    } else {
+      const detail = r.result.errorMessage ? `: ${r.result.errorMessage}` : '';
+      logs.push(`[${r.companyId}] FAILED — ${r.result.errorType ?? 'unknown'}${detail}`);
+    }
+  }
+
   // Save transactions to users/{uid}/transactions/{hash}
   const txns = resultsToTransactions(results);
+  let saveStats = null;
   if (txns.length > 0) {
     try {
-      await storage.saveTransactions(txns, async (msg) => {
+      saveStats = await storage.saveTransactions(txns, async (msg) => {
         console.log(`[${uid}] storage: ${msg}`);
       });
+      logs.push(`Saved ${txns.length} transactions (${saveStats?.added ?? 0} new, ${saveStats?.existing ?? 0} existing)`);
     } catch (e) {
+      const msg = `saveTransactions: ${String(e?.message ?? e)}`;
+      logs.push(msg);
       console.error(`[${uid}] saveTransactions failed:`, e?.message);
       await runRef.update({
         status: 'failed',
         completedAt: FieldValue.serverTimestamp(),
-        error: `saveTransactions: ${String(e?.message ?? e)}`,
+        error: msg,
+        logs,
       });
       throw e;
     }
+  } else {
+    logs.push('No transactions to save');
   }
 
-  // Build per-account summary for run document
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  logs.push(`Done in ${elapsed}s`);
+
+  // Build per-account summary
   const accountSummary = results.map((r) => ({
     companyId: r.companyId,
     success: r.result.success,
     txnCount: r.result.accounts?.reduce((sum, a) => sum + (a.txns?.length ?? 0), 0) ?? 0,
     ...(r.result.errorType ? { errorType: r.result.errorType } : {}),
+    ...(r.result.errorMessage ? { errorMessage: r.result.errorMessage } : {}),
   }));
 
-  // Update run document (replaces Telegram summary message)
   await runRef.update({
     status: 'done',
     completedAt: FieldValue.serverTimestamp(),
     txnCount: txns.length,
     accounts: accountSummary,
+    logs,
   });
 
   // Create re-auth jobs for scrapers that use session-based auth and failed
@@ -139,7 +173,6 @@ async function runMoneymanForUser(uid) {
     if (!r.result.success && AUTH_FAILURE_ERRORS.includes(r.result.errorType)) {
       const account = patchedAccounts.find((a) => a.companyId === r.companyId);
       if (account?.cookie !== undefined) {
-        // This scraper uses session/cookie auth — create a job for the extension
         await db.collection(`users/${uid}/jobs`).add({
           type: 'auth',
           scraper: r.companyId,
@@ -225,7 +258,7 @@ export const runMoneymanOnRequest = onDocumentWritten(
     });
 
     try {
-      await runMoneymanForUser(uid);
+      await runMoneymanForUser(uid, { daysBackOverride: after.data().daysBack });
       await db.doc(`users/${uid}/moneyman/scrapeRequest`).update({
         status: 'done',
         completedAt: FieldValue.serverTimestamp(),
